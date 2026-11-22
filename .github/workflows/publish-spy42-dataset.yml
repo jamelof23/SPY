@@ -111,10 +111,11 @@ jobs:
           import spy42_workflow as workflow
 
           class ActionsGitHubArtifacts(GitHubArtifacts):
-              """Handle absent collaborator flags on same-repository Actions tokens.
+              """Verify the Actions installation-token context and repository identity.
 
-              Missing flags do not confirm write access. The authenticated release
-              endpoint remains authoritative; all of its failures propagate.
+              Repository role flags do not establish an installation token's app
+              permissions. The requested release write is the authority check;
+              its authentication and authorization failures always propagate.
               """
               def require_write_access(self):
                   if (os.environ.get("GITHUB_ACTIONS") != "true"
@@ -128,23 +129,14 @@ jobs:
                   if (not isinstance(info, dict)
                           or str(info.get("full_name", "")).lower() != self.repo.lower()):
                       raise GitHubArtifactError("Authenticated repository identity did not match.")
-                  permissions = info.get("permissions")
-                  if permissions is None:
-                      permissions = {}
-                  if not isinstance(permissions, dict):
-                      raise GitHubArtifactError("Unexpected repository permission metadata.")
-                  flags = [permissions[key] for key in ("push", "maintain", "admin")
-                           if key in permissions]
-                  if flags:
-                      if any(flag is True for flag in flags):
-                          return info
-                      raise GitHubArtifactError(
-                          "Repository write flags are present but do not grant write access."
-                      )
+                  # This workflow supplies github.token with contents: write.
+                  # GET /repos needs only Metadata:read; its collaborator role
+                  # flags do not prove or deny the app token's Contents authority.
+                  # Do not fabricate flags or catch/retry an actual API denial.
                   print(
-                      "Authenticated repository identity verified; the Actions token omits "
-                      "collaborator permission flags. GitHub's release write endpoint "
-                      "will enforce authorization.",
+                      "Authenticated repository identity verified for this Actions job. "
+                      "GitHub's release write endpoint will enforce the installation "
+                      "token's actual Contents permission.",
                       flush=True,
                   )
                   return info
