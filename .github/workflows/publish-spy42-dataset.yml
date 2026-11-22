@@ -1,0 +1,162 @@
+name: Publish SPY42 image dataset
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-spy42-dataset.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spy42-data-2026-11-22-v1
+  cancel-in-progress: false
+
+jobs:
+  publish-dataset:
+    if: github.repository == 'jamelof23/SPY' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install image-rendering dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          requests==2.32.5 matplotlib==3.10.8 numpy==2.3.5 Pillow==13.0.0
+
+      - name: Verify bundled source and publish the dataset
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MPLBACKEND: Agg
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          python - <<'PY'
+          import ast
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import zlib
+
+          REPO = "jamelof23/SPY"
+          TAG = "spy42-data-2026-11-22-v1"
+          NOTEBOOK = Path("SPY_42_Image_Training_Colab.ipynb")
+          EXPECTED_FILES = {
+              "github_artifacts.py", "spy42_workflow.py", "train_spy_images.py",
+              "build_spy_dataset.py", "SPY_daily_with_2019_warmup.csv",
+          }
+          if os.environ.get("GITHUB_REPOSITORY") != REPO:
+              raise RuntimeError("This workflow is bound to jamelof23/SPY.")
+          if not NOTEBOOK.is_file() or NOTEBOOK.stat().st_size > 2 * 1024**2:
+              raise RuntimeError("The updated self-contained notebook is missing or oversized.")
+
+          # Inspect literal data only. Never execute a notebook cell.
+          notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+          payloads = []
+          for cell in notebook.get("cells", []):
+              if cell.get("cell_type") != "code":
+                  continue
+              source = cell.get("source", [])
+              source = source if isinstance(source, str) else "".join(source)
+              if "BUNDLED_FILES" not in source:
+                  continue
+              for node in ast.parse(source).body:
+                  if isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id == "BUNDLED_FILES"
+                      for target in node.targets
+                  ):
+                      payloads.append(ast.literal_eval(node.value))
+          if len(payloads) != 1 or not isinstance(payloads[0], dict):
+              raise RuntimeError("Expected exactly one literal BUNDLED_FILES dictionary.")
+          payload = payloads[0]
+          if set(payload) != EXPECTED_FILES:
+              raise RuntimeError("The notebook bootstrap file set differs from the reviewed bundle.")
+
+          work_root = Path(os.environ["RUNNER_TEMP"]) / "spy42_dataset_publication"
+          bootstrap_dir = work_root / "runtime_code"
+          bootstrap_dir.mkdir(parents=True, exist_ok=True)
+          os.environ["MPLCONFIGDIR"] = str(work_root / "matplotlib")
+          for name, packed in payload.items():
+              if not isinstance(packed, dict) or not re.fullmatch(
+                  r"[0-9a-f]{64}", str(packed.get("sha256", ""))
+              ):
+                  raise RuntimeError("Invalid embedded checksum metadata.")
+              compressed = base64.b64decode(packed["zlib_base64"], validate=True)
+              decoder = zlib.decompressobj()
+              content = decoder.decompress(compressed, 2 * 1024**2 + 1)
+              if (len(content) > 2 * 1024**2 or decoder.unconsumed_tail
+                      or decoder.unused_data or not decoder.eof):
+                  raise RuntimeError("Embedded file exceeds its size bound or is malformed.")
+              if hashlib.sha256(content).hexdigest() != packed["sha256"]:
+                  raise RuntimeError("Embedded file checksum mismatch: " + name)
+              (bootstrap_dir / name).write_bytes(content)
+
+          # Import only dataset orchestration and the GitHub artifact helper.
+          # The trainer is verified as bundled data but never imported or run.
+          sys.path.insert(0, str(bootstrap_dir))
+          from github_artifacts import GitHubArtifacts
+          import spy42_workflow as workflow
+
+          token = os.environ.get("GITHUB_TOKEN")
+          if not token:
+              raise RuntimeError("The repository Actions token was not provided.")
+          github = GitHubArtifacts(REPO, token=token)
+          release = github.get_release(TAG)
+          required_assets = [workflow.DATASET_ASSET, workflow.DATASET_METADATA]
+
+          def summary(message):
+              print(message, flush=True)
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+                  stream.write(message + "\n")
+
+          if release is not None and not release.get("draft"):
+              if not workflow.release_has_assets(release, required_assets):
+                  raise RuntimeError("The published dataset release is incomplete; it will not be overwritten.")
+              assets = {asset["name"]: asset for asset in release["assets"]}
+              metadata_asset = assets[workflow.DATASET_METADATA]
+              if not 0 < metadata_asset["size"] <= 1024**2:
+                  raise RuntimeError("Published dataset metadata has an invalid size.")
+              metadata_path = work_root / workflow.DATASET_METADATA
+              github.download_asset(release, workflow.DATASET_METADATA, metadata_path)
+              metadata = workflow.read_json(metadata_path)
+              workflow._check_metadata(metadata, "spy42_dataset", REPO, TAG)
+              if (metadata.get("source_sha256") != workflow.SOURCE_SHA256
+                      or metadata.get("image_count") != 1733 or metadata.get("lookback") != 42
+                      or metadata.get("archive_name") != workflow.DATASET_ASSET):
+                  raise RuntimeError("Published dataset metadata does not match this snapshot.")
+              archive = assets[workflow.DATASET_ASSET]
+              if archive.get("size", 0) <= 0 or (
+                  archive.get("digest") is not None
+                  and archive["digest"] != "sha256:" + metadata["archive_sha256"]
+              ):
+                  raise RuntimeError("Published archive metadata/checksum disagrees.")
+              summary("Dataset release already complete: skipped rendering, ZIP download, and publication.")
+              summary(f"[Open the 1,733-image dataset](https://github.com/{REPO}/releases/tag/{TAG})")
+              raise SystemExit(0)
+
+          data_root = workflow.ensure_dataset(
+              github, TAG, work_root, bootstrap_dir, allow_bootstrap=True, workers=2
+          )
+          if len(list((data_root / "images").glob("*/*.png"))) != 1733:
+              raise RuntimeError("Published dataset did not contain the expected 1,733 images.")
+          published = github.get_release(TAG)
+          if (published is None or published.get("draft")
+                  or not workflow.release_has_assets(published, required_assets)):
+              raise RuntimeError("Dataset publication could not be confirmed.")
+          summary("Published 1,733 SPY chart images with manifest, configuration, source, and checksums.")
+          summary(f"[Open the dataset release](https://github.com/{REPO}/releases/tag/{TAG})")
+          summary("No Torch installation, model training, model upload, or final-test evaluation was performed.")
+          PY
