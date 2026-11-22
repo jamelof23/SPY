@@ -18,7 +18,7 @@ jobs:
   publish-dataset:
     if: github.repository == 'jamelof23/SPY' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -107,13 +107,52 @@ jobs:
           # Import only dataset orchestration and the GitHub artifact helper.
           # The trainer is verified as bundled data but never imported or run.
           sys.path.insert(0, str(bootstrap_dir))
-          from github_artifacts import GitHubArtifacts
+          from github_artifacts import GitHubArtifacts, GitHubArtifactError
           import spy42_workflow as workflow
+
+          class ActionsGitHubArtifacts(GitHubArtifacts):
+              """Handle absent collaborator flags on same-repository Actions tokens.
+
+              Missing flags do not confirm write access. The authenticated release
+              endpoint remains authoritative; all of its failures propagate.
+              """
+              def require_write_access(self):
+                  if (os.environ.get("GITHUB_ACTIONS") != "true"
+                          or os.environ.get("GITHUB_REPOSITORY", "").lower() != self.repo.lower()):
+                      raise GitHubArtifactError(
+                          "Actions-specific preflight requires the same repository's Actions job."
+                      )
+                  if not self._token:
+                      raise GitHubArtifactError("The repository Actions token is required.")
+                  info = self._api("GET", "", authenticated=True)
+                  if (not isinstance(info, dict)
+                          or str(info.get("full_name", "")).lower() != self.repo.lower()):
+                      raise GitHubArtifactError("Authenticated repository identity did not match.")
+                  permissions = info.get("permissions")
+                  if permissions is None:
+                      permissions = {}
+                  if not isinstance(permissions, dict):
+                      raise GitHubArtifactError("Unexpected repository permission metadata.")
+                  flags = [permissions[key] for key in ("push", "maintain", "admin")
+                           if key in permissions]
+                  if flags:
+                      if any(flag is True for flag in flags):
+                          return info
+                      raise GitHubArtifactError(
+                          "Repository write flags are present but do not grant write access."
+                      )
+                  print(
+                      "Authenticated repository identity verified; the Actions token omits "
+                      "collaborator permission flags. GitHub's release write endpoint "
+                      "will enforce authorization.",
+                      flush=True,
+                  )
+                  return info
 
           token = os.environ.get("GITHUB_TOKEN")
           if not token:
               raise RuntimeError("The repository Actions token was not provided.")
-          github = GitHubArtifacts(REPO, token=token)
+          github = ActionsGitHubArtifacts(REPO, token=token)
           release = github.get_release(TAG)
           required_assets = [workflow.DATASET_ASSET, workflow.DATASET_METADATA]
 
