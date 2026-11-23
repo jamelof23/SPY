@@ -1,0 +1,104 @@
+name: Report SPY42 validation results
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/report-spy42-validation.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    if: github.repository == 'jamelof23/SPY' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the published completed model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/spy42_validation"
+          gh release download spy42-model-v1 --repo jamelof23/SPY --pattern 'SPY_42_model.zip' --dir "${RUNNER_TEMP}/spy42_validation" --clobber
+          echo "43af5753163c4e383256625b244c89d98f04ae756b02d2270a64379a11e620b2  ${RUNNER_TEMP}/spy42_validation/SPY_42_model.zip" | sha256sum --check
+
+      - name: Read exact saved 2025 metrics without retraining or evaluating 2026
+        env:
+          ZIP: ${{ runner.temp }}/spy42_validation/SPY_42_model.zip
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'spy42_validation'
+          zpath = pathlib.Path(os.environ['ZIP'])
+          with zipfile.ZipFile(zpath) as z:
+              members = z.infolist()
+              if len(members) > 2000:
+                  raise RuntimeError('Unexpected archive size')
+              def get_json(basename):
+                  candidates = [x for x in members if x.filename.split('/')[-1] == basename]
+                  if len(candidates) != 1 or candidates[0].file_size > 2_000_000:
+                      raise RuntimeError('Expected exactly one modest-size ' + basename)
+                  return json.loads(z.read(candidates[0]).decode('utf-8'))
+              metrics = get_json('validation_metrics.json')
+              config = get_json('run_config.json')
+          if not isinstance(metrics, dict) or not isinstance(config, dict):
+              raise RuntimeError('Unexpected metrics/config format')
+          if config.get('test_target_values_loaded') is not False:
+              raise RuntimeError('Final-test isolation cannot be verified.')
+          if config.get('validation_years') != [2025] or config.get('training_years') != [2020, 2021, 2022, 2023, 2024]:
+              raise RuntimeError('Wrong train/validation split.')
+          if config.get('input_features') != 'image_pixels_only':
+              raise RuntimeError('Expected chart pixels as the only model inputs')
+          def clean(value):
+              return str(value).replace('|','\\|').replace('\\n',' ').replace('\\r',' ')[:1000]
+          def flatten(value,prefix='',depth=0):
+              if depth > 5:
+                  return [(prefix, str(value)[:100])]
+              if isinstance(value,dict):
+                  out=[]
+                  for key,val in value.items():
+                      out.extend(flatten(val, (prefix+'.' if prefix else '')+str(key), depth+1))
+                  return out
+              if isinstance(value,list) and len(value)<=10:
+                  out=[]
+                  for index,val in enumerate(value):
+                      out.extend(flatten(val, f'{prefix}[{index}]', depth+1))
+                  return out
+              return [(prefix,value)]
+          lines = ['# SPY42 · 2025 validation report','',
+              '**Source:** trained `spy42-model-v1` published on GitHub; verified archive SHA-256.',
+              '**Train:** 2020–2024, 1,258 images. **Validation:** 2025, 250 images.',
+              '**Final 2026 test:** not evaluated.', '',
+              '## Saved metrics', '', '| Metric | Value |', '|---|---:|']
+          for key,value in flatten(metrics):
+              lines.append(f'| `{clean(key)}` | {clean(value)} |')
+          lines.extend(['','## Model configuration (selected fields)', '',
+              '| Setting | Value |', '|---|---|'])
+          for key in ['best_epoch', 'device', 'input_features', 'train_image_count','validation_image_count','training_years','validation_years','architecture','transform','test_target_values_loaded']:
+              if key in config:
+                  lines.append(f'| `{key}` | `{clean(config[key])}` |')
+          lines.extend(['', 'This is development-set performance and does not establish live-trading profitability.',
+              'Model predicts next-session open-to-close candle direction/body; not option returns.', ''])
+          report = '\n'.join(lines)
+          (root/'VALIDATION_REPORT.md').write_text(report, encoding='utf-8')
+          (root/'validation_metrics.json').write_text(json.dumps(metrics,indent=2)+'\n',encoding='utf-8')
+          (root/'run_config_summary.json').write_text(json.dumps({key:config.get(key) for key in ['best_epoch','device','input_features','training_years','validation_years','architecture','transform','train_image_count','validation_image_count','test_target_values_loaded']},indent=2)+'\n',encoding='utf-8')
+          print('=== BEGIN EXACT SAVED VALIDATION METRICS ===',flush=True)
+          print(json.dumps(metrics,indent=2,sort_keys=True),flush=True)
+          print('=== END EXACT SAVED VALIDATION METRICS ===',flush=True)
+          print('Selected model configuration:',json.dumps(config,sort_keys=True)[:12000],flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+              f.write(report)
+          PY
+
+      - name: Attach readable report
+        uses: actions/upload-artifact@v7
+        with:
+          name: spy42-2025-validation-report
+          path: ${{ runner.temp }}/spy42_validation/VALIDATION_REPORT.md
+          if-no-files-found: error
+          retention-days: 30
